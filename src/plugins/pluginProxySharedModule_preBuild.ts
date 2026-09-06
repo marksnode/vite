@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, realpathSync } from 'fs';
-import { createRequire } from 'module';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'fs';
+import type { Dirent } from 'fs';
+import { createRequire, isBuiltin } from 'module';
 import * as path from 'node:path';
 import { pathToFileURL } from 'url';
 import type { Plugin, ResolvedConfig, UserConfig, ViteDevServer } from 'vite';
@@ -323,6 +324,98 @@ export function isSharedPackageDependency(sharedKey: string, dependency: string)
   return reachable.has(dependency);
 }
 
+const sharedRuntimeDependencyCache = new Map<string, Set<string>>();
+const SOURCE_FILE_RE = /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/;
+const NON_RUNTIME_SOURCE_RE = /(?:\.d\.[cm]?ts|\.(?:test|spec|stories)\.[cm]?[jt]sx?)$/;
+const NON_RUNTIME_DIRS = new Set(['node_modules', '__tests__', 'dist', 'build']);
+/** Bundled artifacts of a published package never import workspace packages; skip them instead of scanning megabytes. */
+const MAX_SCANNED_SOURCE_BYTES = 256 * 1024;
+
+const BARE_PACKAGE_SPECIFIER_RE =
+  /^(?:@[^\s'"`()\/]+\/)?[^\s'"`()\/.@][^\s'"`()\/]*(?:\/[^\s'"`()]*)?$/;
+
+/** Bare specifiers a source file imports at runtime: `import type` / `export type` statements are dropped. */
+export function getRuntimeImportSpecifiers(code: string): string[] {
+  const stripped = code
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+    .replace(
+      /\b(?:import|export)\s+type\s+(?:\{[^}]*\}|\*\s+as\s+\w+|\w+(?:\s*,\s*\{[^}]*\})?)\s*from\s*(['"])[^'"\n]*\1/g,
+      ''
+    );
+  const specifiers: string[] = [];
+  const specifierRe =
+    /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1/g;
+  for (const match of stripped.matchAll(specifierRe)) {
+    const specifier = match[2];
+    // Only bare package specifiers name a dependency: paths, virtual ids, Node builtins and the
+    // string fragments a minified bundle happens to place after `import`/`from` do not.
+    if (!BARE_PACKAGE_SPECIFIER_RE.test(specifier) || isBuiltin(specifier)) continue;
+    specifiers.push(specifier);
+  }
+  return specifiers;
+}
+
+function collectRuntimeImports(dir: string, into: Set<string>): void {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (!NON_RUNTIME_DIRS.has(entry.name))
+        collectRuntimeImports(path.join(dir, entry.name), into);
+      continue;
+    }
+    if (!SOURCE_FILE_RE.test(entry.name) || NON_RUNTIME_SOURCE_RE.test(entry.name)) continue;
+    const file = path.join(dir, entry.name);
+    let code: string;
+    try {
+      if (statSync(file).size > MAX_SCANNED_SOURCE_BYTES) continue;
+      code = readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const specifier of getRuntimeImportSpecifiers(code)) into.add(specifier);
+  }
+}
+
+/**
+ * Whether `dependency` is reachable from the shared package through the imports its source files
+ * (and those of the workspace packages they pull in) actually evaluate. Unlike the manifest walk
+ * above this ignores `import type` edges and stops at `node_modules` boundaries, so it approximates
+ * the fallback's evaluation graph rather than the package's declared closure — in a monorepo the
+ * latter covers far more than the module graph ever does.
+ */
+export function isSharedPackageRuntimeDependency(sharedKey: string, dependency: string): boolean {
+  const sharedPackage = getPackageName(sharedKey);
+  let reachable = sharedRuntimeDependencyCache.get(sharedPackage);
+  if (!reachable) {
+    reachable = new Set<string>();
+    const visited = new Set<string>();
+    const queue = [getInstalledPackageJson(sharedPackage, { packageName: sharedPackage })];
+    while (queue.length) {
+      const installed = queue.shift();
+      if (!installed || visited.has(installed.dir)) continue;
+      visited.add(installed.dir);
+      const specifiers = new Set<string>();
+      collectRuntimeImports(installed.dir, specifiers);
+      for (const specifier of specifiers) {
+        const dep = getPackageName(specifier);
+        if (dep === sharedPackage) continue;
+        reachable.add(dep);
+        const manifest = getDependencyManifest(dep, installed.dir);
+        // Only workspace packages get bundled into the fallback; a node_modules package stays a leaf.
+        if (manifest && !isNodeModulePath(manifest.dir)) queue.push(manifest);
+      }
+    }
+    sharedRuntimeDependencyCache.set(sharedPackage, reachable);
+  }
+  return reachable.has(dependency);
+}
+
 export function proxySharedModule(options: {
   shared?: NormalizedShared;
   federationOptions?: NormalizedModuleFederationOptions;
@@ -463,6 +556,7 @@ export function proxySharedModule(options: {
         emittedTreeShakingProviders.clear();
         sharedDependencyCache.clear();
         dependencyManifestCache.clear();
+        sharedRuntimeDependencyCache.clear();
         workspacePackageNameCache.clear();
         const isVinext = hasPackageDependency('vinext');
         const isAstro = hasPackageDependency('astro');
@@ -619,7 +713,20 @@ export function proxySharedModule(options: {
         // cycle) keeps its ordinary edge too. Proxying it would place the loadShare
         // glue inside the package's own evaluation cycle, where the glue's eager
         // export reads run before the fallback body has initialized.
-        if (importerPackage && isSharedPackageDependency(key, importerPackage)) return;
+        // An unshared workspace importer is judged by the imports the shared package
+        // evaluates, not by its manifest closure: in a monorepo that closure reaches
+        // most of the workspace through type-only dependencies, and an ordinary edge
+        // there binds the importer to the local fallback even when a host provides
+        // the singleton.
+        if (importerPackage) {
+          const importerIsUnsharedWorkspacePackage =
+            !isNodeModulePath(importer!) &&
+            !Object.keys(shared).some((sharedKey) => getPackageName(sharedKey) === importerPackage);
+          const keepsOrdinaryEdge = importerIsUnsharedWorkspacePackage
+            ? isSharedPackageRuntimeDependency(key, importerPackage)
+            : isSharedPackageDependency(key, importerPackage);
+          if (keepsOrdinaryEdge) return;
+        }
         if (useDirectReactImport && key === 'react') return;
         if (isAssetLikeImport(source)) return;
         if (isBuildConfigImporter(importer)) return;
